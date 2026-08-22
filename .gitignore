@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.cache/
+
+input/
+output/
+runtime/
+droid_depth_input/
+droid_depth_output/
+droid_depth_runtime/
+
+*.svo
+*.run
+*.pth
+*.png
+*.mp4
