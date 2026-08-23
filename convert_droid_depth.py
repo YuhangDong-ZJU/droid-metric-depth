@@ -678,10 +678,39 @@ def main() -> int:
         if found != selected:
             raise ValueError(f"Selected episodes are not in the chosen chunks: {sorted(selected - found)}")
     jobs = [(row, role) for row in rows for role in ROLES]
+    all_job_count = len(jobs)
+    if not args.overwrite:
+        # Rebuild the shared queue from incomplete outputs before sharding it.
+        # Sharding first makes a resumed run preserve the old imbalance: GPUs
+        # whose original jobs are complete exit while one GPU keeps all of its
+        # unfinished jobs. Every worker computes this same deterministic list,
+        # then takes a disjoint slice below.
+        jobs = [
+            (row, role)
+            for row, role in jobs
+            if not (
+                depth_is_valid(depth_dir(args.output_dir, row, role), int(row["length"]))
+                and metadata_is_valid(
+                    metadata_path(args.output_dir, row, role),
+                    row,
+                    role,
+                    args.checkpoint_sha256,
+                    args.batch_size,
+                )
+            )
+        ]
+    pending_job_count = len(jobs)
     jobs = jobs[args.worker_index :: args.num_workers]
+    print(
+        f"[GPU {args.gpu_id}] pending before sharding: "
+        f"{pending_job_count}/{all_job_count}; assigned: {len(jobs)}",
+        flush=True,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     log_path = args.output_dir / "logs" / f"gpu-{args.gpu_id}.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not jobs:
+        return 0
     estimator = Estimator(args.fs_root, args.checkpoint, args.config, args.gpu_id, args.iters)
     failures = 0
     with log_path.open("a", encoding="utf-8", buffering=1) as log:
