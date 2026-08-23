@@ -29,8 +29,8 @@ ZED_SDK_ROOT="$WORK_DIR/zed-sdk-$ZED_SDK_VERSION"
 ZED_SETTINGS_DIR="$INPUT_DIR/calibrations"
 PYZED_VERSION="5.4"
 
-# shellcheck source=prepare_python_env.sh
-source "$SCRIPT_DIR/prepare_python_env.sh"
+# shellcheck source=prepare_uv_env.sh
+source "$SCRIPT_DIR/prepare_uv_env.sh"
 
 detect_zed_cuda_major() {
   local detected
@@ -111,7 +111,7 @@ ensure_zstd() {
 
   if ! "$PYTHON_BIN" -c 'import zstandard' >/dev/null 2>&1; then
     echo "Installing the Python zstandard fallback into the isolated environment."
-    "$PYTHON_BIN" -m pip install --disable-pip-version-check zstandard==0.23.0
+    "$UV_BIN" pip install --python "$PYTHON_BIN" zstandard==0.23.0
   fi
 
   shim_dir="$WORK_DIR/tools/bin"
@@ -259,7 +259,7 @@ ensure_pyzed() {
       echo "Actual:   $actual_sha256"
       return 1
     fi
-    "$PYTHON_BIN" -m pip install --force-reinstall --no-deps "$wheel"
+    "$UV_BIN" pip install --python "$PYTHON_BIN" --reinstall --no-deps "$wheel"
   fi
 
   pyzed_so="$($PYTHON_BIN -c 'import importlib.util; print(importlib.util.find_spec("pyzed.sl").origin)')"
@@ -295,28 +295,28 @@ for command_name in ffmpeg git wget sha256sum ldd; do
 done
 
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
-prepare_python_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
+prepare_uv_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
 PYTHON_BIN="$DROID_DEPTH_PYTHON"
+UV_BIN="$DROID_DEPTH_UV"
 
 if ! "$PYTHON_BIN" -c \
   "import torch, torchvision, xformers, timm, omegaconf, scipy, imageio, PIL, cv2, einops, huggingface_hub, hf_xet, numpy, zstandard; assert torch.__version__.startswith('2.4.1'); assert torchvision.__version__.startswith('0.19.1'); assert numpy.__version__ == '1.26.4'; assert cv2.__version__ == '4.11.0'" \
   >/dev/null 2>&1; then
   echo "Installing conversion dependencies into the isolated Python environment."
-  "$PYTHON_BIN" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
-  "$PYTHON_BIN" -m pip install \
+  "$UV_BIN" pip install --python "$PYTHON_BIN" \
     --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.1 torchvision==0.19.1
-  "$PYTHON_BIN" -m pip install \
+  "$UV_BIN" pip install --python "$PYTHON_BIN" \
     --index-url https://download.pytorch.org/whl/cu121 \
     --no-deps xformers==0.0.28.post1
-  "$PYTHON_BIN" -m pip install \
+  "$UV_BIN" pip install --python "$PYTHON_BIN" \
     numpy==1.26.4 omegaconf==2.3.0 timm==1.0.22 scipy==1.15.3 \
     imageio==2.37.4 pillow einops==0.8.2 \
     opencv-python-headless==4.11.0.86 \
     huggingface_hub==1.28.0 hf_xet==1.6.0 zstandard==0.23.0
 fi
 
-if ! "$PYTHON_BIN" -m pip check; then
+if ! "$UV_BIN" pip check --python "$PYTHON_BIN"; then
   echo "ERROR: dependency conflicts remain inside the isolated Python environment."
   exit 1
 fi

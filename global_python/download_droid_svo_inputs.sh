@@ -15,10 +15,11 @@ BASE_PYTHON="${PYTHON_BIN:-python3}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_ENV_DIR="${DROID_DEPTH_PYTHON_ENV:-$DOWNLOAD_DIR/.droid_depth_runtime/python-env}"
 
-# shellcheck source=prepare_python_env.sh
-source "$SCRIPT_DIR/prepare_python_env.sh"
-prepare_python_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
+# shellcheck source=prepare_uv_env.sh
+source "$SCRIPT_DIR/prepare_uv_env.sh"
+prepare_uv_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
 PYTHON_BIN="$DROID_DEPTH_PYTHON"
+UV_BIN="$DROID_DEPTH_UV"
 
 if ! "$PYTHON_BIN" - <<'PY'
 import huggingface_hub
@@ -26,7 +27,7 @@ import hf_xet
 PY
 then
   echo "Installing download dependencies into the isolated Python environment."
-  "$PYTHON_BIN" -m pip install --disable-pip-version-check \
+  "$UV_BIN" pip install --python "$PYTHON_BIN" \
     huggingface_hub==1.28.0 hf_xet==1.6.0
 fi
 

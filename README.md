@@ -26,14 +26,15 @@ The pipeline downloads selected SVO chunks from [`Sponbebob4258/droid-24k-extern
 
 No administrator privileges are required. The ZED SDK is extracted into the runtime directory supplied on the command line.
 
-### Global Python image variant
+### uv-based global Python image variant (untested)
 
 For container images that do not provide Conda, use the scripts in
-[`global_python/`](global_python/). They use the image's `python3` to create an
-isolated virtual environment inside the selected runtime directory; they do
-not install packages into the image's global Python. Ubuntu 22.04/CUDA 12 and
-Ubuntu 24.04/CUDA 12 or 13 are supported without `sudo`. The conversion and
-output format are otherwise unchanged.
+[`global_python/`](global_python/). This path now bootstraps a pinned,
+runtime-local `uv 0.12.5`, uses uv to create the isolated environment, and uses
+`uv pip` for dependency installation. It does not install packages into the
+image's global Python. Ubuntu 22.04/CUDA 12 and Ubuntu 24.04/CUDA 12 or 13 are
+intended to work without `sudo`; however, the uv migration is currently marked
+**untested**. The conversion and output format are otherwise unchanged.
 
 ## Quick start
 
