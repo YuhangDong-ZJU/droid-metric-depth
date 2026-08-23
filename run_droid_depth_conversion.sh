@@ -35,6 +35,17 @@ detect_zed_cuda_major() {
     echo "${BASH_REMATCH[1]}"
     return 0
   fi
+  if [[ "${CUDA_VERSION:-}" =~ ^(12|13)(\.|$) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  detected="$(nvcc --version 2>/dev/null \
+    | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p' \
+    | head -n 1)"
+  if [[ "$detected" =~ ^(12|13)$ ]]; then
+    echo "$detected"
+    return 0
+  fi
   detected="$(nvidia-smi 2>/dev/null \
     | sed -n 's/.*CUDA Version: \([0-9][0-9]*\).*/\1/p' \
     | head -n 1)"
