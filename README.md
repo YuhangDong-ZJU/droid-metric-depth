@@ -51,11 +51,10 @@ bash run_droid_depth_all.sh \
   2
 ```
 
-## Standard relative layout
+## Repository layout
 
-For clusters that expose datasets and experiment resources through relative
-paths, use the standard-layout wrappers. Paths are anchored to the repository
-root, so the commands work regardless of the caller's current directory:
+`run_droid_depth.sh` provides a single entry point for downloading and
+conversion. Its paths are anchored to the repository root:
 
 ```text
 droid-metric-depth/
@@ -66,32 +65,30 @@ droid-metric-depth/
     └── <exp_name>
 ```
 
-If Miniforge is not already in `PATH`, provide its installation root once:
+If Miniforge is not already in `PATH`, provide its installation root:
 
 ```bash
-export DROID_DEPTH_CONDA_ROOT=/path/to/miniforge
+export MINIFORGE_HOME=/path/to/miniforge
 ```
 
-Download with the default dataset name `droid_depth_input`:
+Download:
 
 ```bash
-bash download_standard_layout.sh "0-18"
+bash run_droid_depth.sh download "0-18"
 ```
 
-Run conversion with an experiment-specific runtime/checkpoint directory:
+Convert:
 
 ```bash
-bash run_standard_layout.sh \
-  "2-8" \
-  "h100_1" \
+bash run_droid_depth.sh convert \
+  "2-8" "h100_1" \
   "0,1,2,3,4,5,6,7" \
   12
 ```
 
-This resolves the input, output, and runtime paths to
-`./DATA/droid_depth_input`, `./DATA/droid_depth_output`, and
-`./Res/h100_1`, respectively. The `DATA/` and `Res/` entries may be regular
-directories or symlinks managed by the cluster.
+The command uses `./DATA/droid_depth_input`, `./DATA/droid_depth_output`, and
+`./Res/<exp_name>`. The `DATA/` and `Res/` entries may be regular directories
+or symlinks managed by the cluster.
 
 The positional arguments are:
 
