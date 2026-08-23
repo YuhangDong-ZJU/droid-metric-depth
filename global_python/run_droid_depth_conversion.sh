@@ -102,6 +102,55 @@ select_zed_installer() {
   export ZED_BUILD_ID ZED_INSTALLER_NAME ZED_INSTALLER_URL ZED_INSTALLER_SHA256
 }
 
+ensure_zstd() {
+  local shim_dir shim
+  if command -v zstd >/dev/null 2>&1; then
+    echo "zstd ready: $(command -v zstd)"
+    return 0
+  fi
+
+  if ! "$PYTHON_BIN" -c 'import zstandard' >/dev/null 2>&1; then
+    echo "Installing the Python zstandard fallback into the isolated environment."
+    "$PYTHON_BIN" -m pip install --disable-pip-version-check zstandard==0.23.0
+  fi
+
+  shim_dir="$WORK_DIR/tools/bin"
+  shim="$shim_dir/zstd"
+  mkdir -p "$shim_dir"
+  "$PYTHON_BIN" - "$shim" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+path = Path(sys.argv[1])
+program = f"""#!{sys.executable}
+import sys
+import zstandard
+
+args = sys.argv[1:]
+if "--version" in args or "-V" in args:
+    print("zstd Python fallback (zstandard " + zstandard.__version__ + ")")
+    raise SystemExit(0)
+
+allowed = {{"-d", "-c", "-dc", "-cd", "--decompress", "--stdout", "-q", "--quiet"}}
+unsupported = [arg for arg in args if arg not in allowed]
+if unsupported:
+    print("Unsupported zstd fallback arguments: " + " ".join(unsupported), file=sys.stderr)
+    raise SystemExit(2)
+if not any(arg in {{"-d", "-dc", "-cd", "--decompress"}} for arg in args):
+    print("The zstd fallback only supports decompression.", file=sys.stderr)
+    raise SystemExit(2)
+
+zstandard.ZstdDecompressor().copy_stream(sys.stdin.buffer, sys.stdout.buffer)
+"""
+path.write_text(program, encoding="utf-8")
+os.chmod(path, 0o700)
+PY
+  export PATH="$shim_dir:$PATH"
+  zstd --version
+  echo "System zstd was unavailable; using the runtime-local Python fallback: $shim"
+}
+
 get_local_zed_version() {
   local version_file="$ZED_SDK_ROOT/zed-config-version.cmake"
   if [[ ! -f "$version_file" ]]; then
@@ -250,7 +299,7 @@ prepare_python_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
 PYTHON_BIN="$DROID_DEPTH_PYTHON"
 
 if ! "$PYTHON_BIN" -c \
-  "import torch, torchvision, xformers, timm, omegaconf, scipy, imageio, PIL, cv2, einops, huggingface_hub, hf_xet, numpy; assert torch.__version__.startswith('2.4.1'); assert torchvision.__version__.startswith('0.19.1'); assert numpy.__version__ == '1.26.4'; assert cv2.__version__ == '4.11.0'" \
+  "import torch, torchvision, xformers, timm, omegaconf, scipy, imageio, PIL, cv2, einops, huggingface_hub, hf_xet, numpy, zstandard; assert torch.__version__.startswith('2.4.1'); assert torchvision.__version__.startswith('0.19.1'); assert numpy.__version__ == '1.26.4'; assert cv2.__version__ == '4.11.0'" \
   >/dev/null 2>&1; then
   echo "Installing conversion dependencies into the isolated Python environment."
   "$PYTHON_BIN" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
@@ -264,7 +313,7 @@ if ! "$PYTHON_BIN" -c \
     numpy==1.26.4 omegaconf==2.3.0 timm==1.0.22 scipy==1.15.3 \
     imageio==2.37.4 pillow einops==0.8.2 \
     opencv-python-headless==4.11.0.86 \
-    huggingface_hub==1.28.0 hf_xet==1.6.0
+    huggingface_hub==1.28.0 hf_xet==1.6.0 zstandard==0.23.0
 fi
 
 if ! "$PYTHON_BIN" -m pip check; then
@@ -295,6 +344,7 @@ print(f"Isolated Python ready: {sys.executable}", flush=True)
 print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}", flush=True)
 PY
 
+ensure_zstd
 ensure_zed_sdk
 export ZED_DIR="$ZED_SDK_ROOT"
 export LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:${LD_LIBRARY_PATH:-}"

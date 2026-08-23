@@ -12,6 +12,11 @@ required. If the standard-library `venv` module is unavailable, the script
 bootstraps `virtualenv` inside the runtime directory without installing it into
 the global Python environment.
 
+If the image does not provide the `zstd` command required by the ZED SDK
+installer, the script installs Python `zstandard` into the isolated environment
+and creates a decompression-only fallback under `<runtime_dir>/tools/bin`.
+This also requires neither Conda nor `sudo`.
+
 Rootless ZED SDK installation supports these pinned combinations:
 
 - Ubuntu 22.04 with CUDA 12
