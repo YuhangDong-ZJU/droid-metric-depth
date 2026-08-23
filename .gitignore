@@ -8,6 +8,8 @@ runtime/
 droid_depth_input/
 droid_depth_output/
 droid_depth_runtime/
+DATA/
+Res/
 
 *.svo
 *.run

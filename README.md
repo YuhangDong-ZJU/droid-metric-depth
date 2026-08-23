@@ -51,6 +51,48 @@ bash run_droid_depth_all.sh \
   2
 ```
 
+## Standard relative layout
+
+For clusters that expose datasets and experiment resources through relative
+paths, use the standard-layout wrappers. Paths are anchored to the repository
+root, so the commands work regardless of the caller's current directory:
+
+```text
+droid-metric-depth/
+├── DATA/
+│   ├── droid_depth_input
+│   └── droid_depth_output
+└── Res/
+    └── <exp_name>
+```
+
+If Miniforge is not already in `PATH`, provide its installation root once:
+
+```bash
+export DROID_DEPTH_CONDA_ROOT=/path/to/miniforge
+```
+
+Download with the default dataset name `droid_depth_input`:
+
+```bash
+bash download_standard_layout.sh "0-18"
+```
+
+Run conversion with an experiment-specific runtime/checkpoint directory:
+
+```bash
+bash run_standard_layout.sh \
+  "2-8" \
+  "h100_1" \
+  "0,1,2,3,4,5,6,7" \
+  12
+```
+
+This resolves the input, output, and runtime paths to
+`./DATA/droid_depth_input`, `./DATA/droid_depth_output`, and
+`./Res/h100_1`, respectively. The `DATA/` and `Res/` entries may be regular
+directories or symlinks managed by the cluster.
+
 The positional arguments are:
 
 ```text
