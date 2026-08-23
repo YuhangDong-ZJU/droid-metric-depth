@@ -29,15 +29,18 @@ prepare_python_env() {
   echo "Creating isolated Python environment: $env_dir"
   if ! "$base_python" -m venv "$partial_dir" >/dev/null 2>&1; then
     echo "python -m venv is unavailable; bootstrapping virtualenv locally."
-    if ! "$base_python" -m pip --version >/dev/null 2>&1; then
+    if ! (unset PYTHONNOUSERSITE; "$base_python" -m pip --version >/dev/null 2>&1); then
       echo "ERROR: neither venv nor pip is available for $base_python" >&2
       return 1
     fi
     bootstrap_dir="${env_dir}.virtualenv-bootstrap"
     mkdir -p "$bootstrap_dir"
-    PIP_ROOT_USER_ACTION=ignore "$base_python" -m pip install \
-      --disable-pip-version-check --upgrade --target "$bootstrap_dir" \
-      virtualenv==20.35.4
+    (
+      unset PYTHONNOUSERSITE
+      PIP_ROOT_USER_ACTION=ignore "$base_python" -m pip install \
+        --disable-pip-version-check --upgrade --target "$bootstrap_dir" \
+        virtualenv==20.35.4
+    )
     PYTHONPATH="$bootstrap_dir" "$base_python" -m virtualenv \
       --no-download "$partial_dir"
   fi
