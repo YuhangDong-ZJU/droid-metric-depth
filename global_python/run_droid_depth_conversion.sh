@@ -14,8 +14,9 @@ OUTPUT_DIR="$3"
 GPU_IDS="${4:-all}"
 WORK_DIR="${5:-$HOME/droid_depth_runtime}"
 BATCH_SIZE="${6:-2}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+BASE_PYTHON="${DROID_DEPTH_BASE_PYTHON:-${PYTHON_BIN:-python3}}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_ENV_DIR="${DROID_DEPTH_PYTHON_ENV:-$WORK_DIR/python-env}"
 CONVERTER="$SCRIPT_DIR/convert_droid_depth.py"
 FS_ROOT="$WORK_DIR/FoundationStereo"
 MODEL_DIR="$WORK_DIR/23-51-11"
@@ -26,9 +27,80 @@ CHECKPOINT_SHA256="60e79bde9c6a00acea551625ff814fe06e5a6806e2c0c9829baee248de87c
 ZED_SDK_VERSION="5.4.1"
 ZED_SDK_ROOT="$WORK_DIR/zed-sdk-$ZED_SDK_VERSION"
 ZED_SETTINGS_DIR="$INPUT_DIR/calibrations"
-ZED_INSTALLER_SHA256="35edc822377c5b548fb80f251d8347702cfc2f064f6b9920e29feebe387aec26"
 PYZED_VERSION="5.4"
-PYZED_WHEEL_SHA256="7521e6d7da8e8a98603dd7a0302c18fba2455024c9e77ec186d1ee01a4a786e9"
+
+# shellcheck source=prepare_python_env.sh
+source "$SCRIPT_DIR/prepare_python_env.sh"
+
+detect_zed_cuda_major() {
+  local detected
+  if [[ "${ZED_CUDA_MAJOR:-auto}" =~ ^(12|13)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  detected="$($BASE_PYTHON -c \
+    'import torch; print((torch.version.cuda or "").split(".")[0])' \
+    2>/dev/null || true)"
+  if [[ "$detected" =~ ^(12|13)$ ]]; then
+    echo "$detected"
+    return 0
+  fi
+  detected="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+  if [[ "$detected" =~ ^(12|13)$ ]]; then
+    echo "$detected"
+    return 0
+  fi
+  echo 12
+}
+
+select_zed_installer() {
+  local cuda_major="$1"
+  if [[ ! -r /etc/os-release ]]; then
+    echo "ERROR: cannot identify the operating system from /etc/os-release." >&2
+    return 1
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    echo "ERROR: rootless ZED SDK installation requires Ubuntu." >&2
+    echo "Detected: ${ID:-unknown} ${VERSION_ID:-unknown}" >&2
+    return 1
+  fi
+  # A recent NVIDIA driver may advertise CUDA 13 even when an Ubuntu 22 image
+  # intentionally uses the CUDA 12 runtime. The CUDA 12 ZED build remains
+  # compatible with that newer driver and is the pinned Ubuntu 22 build here.
+  if [[ "${VERSION_ID:-}" == "22.04" && "$cuda_major" == "13" ]]; then
+    echo "Ubuntu 22.04 detected; selecting the pinned CUDA 12 ZED build." >&2
+    cuda_major=12
+  fi
+
+  case "${VERSION_ID:-}:$cuda_major" in
+    22.04:12)
+      ZED_BUILD_ID="ubuntu22-cuda12"
+      ZED_INSTALLER_NAME="ZED_SDK_Ubuntu22_cuda12_v${ZED_SDK_VERSION}.run"
+      ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu22"
+      ZED_INSTALLER_SHA256="35edc822377c5b548fb80f251d8347702cfc2f064f6b9920e29feebe387aec26"
+      ;;
+    24.04:12)
+      ZED_BUILD_ID="ubuntu24-cuda12"
+      ZED_INSTALLER_NAME="ZED_SDK_Ubuntu24_cuda12_v${ZED_SDK_VERSION}.run"
+      ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu24"
+      ZED_INSTALLER_SHA256="bbed0c5fc563cdf1b611d1ea5fdbecd8ae5d059f85d0cf56ca93d8a0d6706877"
+      ;;
+    24.04:13)
+      ZED_BUILD_ID="ubuntu24-cuda13"
+      ZED_INSTALLER_NAME="ZED_SDK_Ubuntu24_cuda13_v${ZED_SDK_VERSION}.run"
+      ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu13/ubuntu24"
+      ZED_INSTALLER_SHA256="b576415517e869f8346beb961b5faa554e3b2e2dde20ca2eaa72f03cbef321ed"
+      ;;
+    *)
+      echo "ERROR: unsupported rootless ZED SDK combination: Ubuntu ${VERSION_ID:-unknown}, CUDA $cuda_major." >&2
+      echo "Supported: Ubuntu 22.04/CUDA 12, Ubuntu 24.04/CUDA 12 or 13." >&2
+      return 1
+      ;;
+  esac
+  export ZED_BUILD_ID ZED_INSTALLER_NAME ZED_INSTALLER_URL ZED_INSTALLER_SHA256
+}
 
 get_local_zed_version() {
   local version_file="$ZED_SDK_ROOT/zed-config-version.cmake"
@@ -40,36 +112,32 @@ get_local_zed_version() {
 }
 
 ensure_zed_sdk() {
-  local installed_version installer installer_url actual_sha256 partial_root stale_root
+  local installed_version installer actual_sha256 partial_root stale_root build_marker installed_build
+  local cuda_major
+  cuda_major="$(detect_zed_cuda_major)"
+  select_zed_installer "$cuda_major"
+  build_marker="$ZED_SDK_ROOT/.droid_depth_build"
+  installed_build="$(cat "$build_marker" 2>/dev/null || true)"
   installed_version="$(get_local_zed_version)"
   if [[ "$installed_version" == "$ZED_SDK_VERSION" \
       && -r "$ZED_SDK_ROOT/lib/libsl_zed.so" \
-      && -r "$ZED_SDK_ROOT/resources/neural_depth_5.3.model" ]]; then
-    echo "User-local ZED SDK ready: $ZED_SDK_ROOT ($installed_version)"
+      && -r "$ZED_SDK_ROOT/resources/neural_depth_5.3.model" \
+      && ( "$installed_build" == "$ZED_BUILD_ID" \
+        || ( -z "$installed_build" && "$ZED_BUILD_ID" == "ubuntu22-cuda12" ) ) ]]; then
+    printf '%s\n' "$ZED_BUILD_ID" > "$build_marker"
+    echo "User-local ZED SDK ready: $ZED_SDK_ROOT ($installed_version, $ZED_BUILD_ID)"
     return 0
   fi
 
-  if [[ ! -r /etc/os-release ]]; then
-    echo "ERROR: cannot identify the operating system from /etc/os-release."
-    return 1
-  fi
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "22.04" ]]; then
-    echo "ERROR: rootless ZED SDK installation supports Ubuntu 22.04 only."
-    echo "Detected: ${ID:-unknown} ${VERSION_ID:-unknown}"
-    return 1
-  fi
   if [[ "$(uname -m)" != "x86_64" ]]; then
     echo "ERROR: rootless ZED SDK installation supports x86_64 only."
     return 1
   fi
 
-  installer="$WORK_DIR/ZED_SDK_Ubuntu22_cuda12_v${ZED_SDK_VERSION}.run"
-  installer_url="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu22"
-  echo "Downloading ZED SDK $ZED_SDK_VERSION for user-local extraction."
+  installer="$WORK_DIR/$ZED_INSTALLER_NAME"
+  echo "Downloading ZED SDK $ZED_SDK_VERSION ($ZED_BUILD_ID) for user-local extraction."
   wget --https-only --continue --progress=dot:giga \
-    --output-document="$installer" "$installer_url"
+    --output-document="$installer" "$ZED_INSTALLER_URL"
   if [[ ! -s "$installer" ]] || ! head -c 64 "$installer" | grep -q '^#!/bin/'; then
     echo "ERROR: downloaded ZED SDK installer is invalid: $installer"
     return 1
@@ -109,29 +177,37 @@ ensure_zed_sdk() {
     mv "$ZED_SDK_ROOT" "$stale_root"
     echo "Moved the previous incomplete SDK to: $stale_root"
   fi
+  printf '%s\n' "$ZED_BUILD_ID" > "$partial_root/.droid_depth_build"
   mv "$partial_root" "$ZED_SDK_ROOT"
   rm -f "$installer"
   echo "User-local ZED SDK installed without sudo: $ZED_SDK_ROOT"
 }
 
 ensure_pyzed() {
-  local wheel wheel_url actual_sha256 installed_version pyzed_so python_version
-  wheel="$WORK_DIR/pyzed-${PYZED_VERSION}-cp310-cp310-linux_x86_64.whl"
+  local wheel wheel_url actual_sha256 expected_sha256 installed_version pyzed_so python_tag
+  python_tag="$($PYTHON_BIN -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
+  case "$python_tag" in
+    cp310) expected_sha256="7521e6d7da8e8a98603dd7a0302c18fba2455024c9e77ec186d1ee01a4a786e9" ;;
+    cp311) expected_sha256="d132cd7e03e1a5749f9d258c33f9f3e4c8cee421fe7164a02a32f38b018da83f" ;;
+    cp312) expected_sha256="554363fcaa76fc307c180cd1da386ce4a48bdf4200bd83827ef5a5404b8255e1" ;;
+    cp313) expected_sha256="95d1272279c07af2c2c79f098c55fcc6c251ef3b4dd82c89bd6154cdb0e4e3e0" ;;
+    *)
+      echo "ERROR: automatic PyZED installation supports Python 3.10-3.13, got $python_tag."
+      return 1
+      ;;
+  esac
+  wheel="$WORK_DIR/pyzed-${PYZED_VERSION}-${python_tag}-${python_tag}-linux_x86_64.whl"
   wheel_url="https://download.stereolabs.com/zedsdk/${PYZED_VERSION}/whl/linux_x86_64/$(basename "$wheel")"
   installed_version="$($PYTHON_BIN -c \
     'import importlib.metadata as m; print(m.version("pyzed"))' 2>/dev/null || true)"
   if [[ "$installed_version" != "$PYZED_VERSION" ]]; then
-    python_version="$($PYTHON_BIN -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    if [[ "$python_version" != "3.10" ]]; then
-      echo "ERROR: automatic PyZED installation requires Python 3.10, got $python_version."
-      echo "Use a Python 3.10 image or preinstall PyZED $PYZED_VERSION for this Python."
-      return 1
-    fi
     wget --https-only --continue --progress=dot:giga \
       --output-document="$wheel" "$wheel_url"
     actual_sha256="$(sha256sum "$wheel" | awk '{print $1}')"
-    if [[ "$actual_sha256" != "$PYZED_WHEEL_SHA256" ]]; then
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
       echo "ERROR: PyZED wheel SHA256 mismatch."
+      echo "Expected: $expected_sha256"
+      echo "Actual:   $actual_sha256"
       return 1
     fi
     "$PYTHON_BIN" -m pip install --force-reinstall --no-deps "$wheel"
@@ -154,16 +230,6 @@ if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "ERROR: Python is not available: $PYTHON_BIN"
-  echo "Set PYTHON_BIN to the global Python executable if it is not python3."
-  exit 1
-fi
-PYTHON_BIN="$(command -v "$PYTHON_BIN")"
-if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-  echo "ERROR: pip is not available for the global Python: $PYTHON_BIN"
-  exit 1
-fi
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "ERROR: nvidia-smi is not available."
   exit 1
@@ -180,12 +246,14 @@ for command_name in ffmpeg git wget sha256sum ldd; do
 done
 
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+prepare_python_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
+PYTHON_BIN="$DROID_DEPTH_PYTHON"
 
 if ! "$PYTHON_BIN" -c \
-  "import torch, torchvision, xformers, timm, omegaconf, scipy, imageio, PIL, cv2, einops, huggingface_hub, hf_xet, numpy" \
+  "import torch, torchvision, xformers, timm, omegaconf, scipy, imageio, PIL, cv2, einops, huggingface_hub, hf_xet, numpy; assert torch.__version__.startswith('2.4.1'); assert torchvision.__version__.startswith('0.19.1'); assert numpy.__version__ == '1.26.4'; assert cv2.__version__ == '4.11.0'" \
   >/dev/null 2>&1; then
-  echo "Installing conversion dependencies into the global Python environment."
-  "$PYTHON_BIN" -m pip install --upgrade pip
+  echo "Installing conversion dependencies into the isolated Python environment."
+  "$PYTHON_BIN" -m pip install --disable-pip-version-check --upgrade pip setuptools wheel
   "$PYTHON_BIN" -m pip install \
     --index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.1 torchvision==0.19.1
@@ -193,8 +261,15 @@ if ! "$PYTHON_BIN" -c \
     --index-url https://download.pytorch.org/whl/cu121 \
     --no-deps xformers==0.0.28.post1
   "$PYTHON_BIN" -m pip install \
-    numpy==1.26.4 omegaconf==2.3.0 timm==1.0.22 scipy imageio pillow \
-    opencv-python-headless einops huggingface_hub hf_xet
+    numpy==1.26.4 omegaconf==2.3.0 timm==1.0.22 scipy==1.15.3 \
+    imageio==2.37.4 pillow einops==0.8.2 \
+    opencv-python-headless==4.11.0.86 \
+    huggingface_hub==1.28.0 hf_xet==1.6.0
+fi
+
+if ! "$PYTHON_BIN" -m pip check; then
+  echo "ERROR: dependency conflicts remain inside the isolated Python environment."
+  exit 1
 fi
 
 "$PYTHON_BIN" - <<'PY'
@@ -216,7 +291,7 @@ from PIL import Image
 if not torch.cuda.is_available():
     print("ERROR: torch.cuda.is_available() is False", file=sys.stderr)
     raise SystemExit(1)
-print(f"Global Python ready: {sys.executable}", flush=True)
+print(f"Isolated Python ready: {sys.executable}", flush=True)
 print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}", flush=True)
 PY
 

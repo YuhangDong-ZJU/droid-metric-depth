@@ -29,8 +29,10 @@ No administrator privileges are required. The ZED SDK is extracted into the runt
 ### Global Python image variant
 
 For container images that do not provide Conda, use the scripts in
-[`global_python/`](global_python/). They use the image's global `python3` and
-automatically install missing Python packages with `pip`; the conversion and
+[`global_python/`](global_python/). They use the image's `python3` to create an
+isolated virtual environment inside the selected runtime directory; they do
+not install packages into the image's global Python. Ubuntu 22.04/CUDA 12 and
+Ubuntu 24.04/CUDA 12 or 13 are supported without `sudo`. The conversion and
 output format are otherwise unchanged.
 
 ## Quick start

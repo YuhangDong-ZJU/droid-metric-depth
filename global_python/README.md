@@ -1,12 +1,24 @@
 # Global Python variant
 
 This directory contains the no-Conda version of the DROID metric-depth
-pipeline. It uses the container image's global Python environment and installs
-missing Python dependencies with `pip`.
+pipeline. It uses the container image's Python only to create an isolated
+virtual environment under the selected runtime directory. All downloaded
+Python packages, including PyTorch and PyZED, are installed into that virtual
+environment; the image's global Python packages are never modified.
 
-The image must provide Python with `pip`, an NVIDIA driver, and the system
-commands checked by the scripts. Python 3.10 is recommended and is required for
-the pinned automatic PyZED wheel installation.
+The image must provide Python 3.10-3.13, an NVIDIA driver, and the system
+commands checked by the scripts. Conda and administrator privileges are not
+required. If the standard-library `venv` module is unavailable, the script
+bootstraps `virtualenv` inside the runtime directory without installing it into
+the global Python environment.
+
+Rootless ZED SDK installation supports these pinned combinations:
+
+- Ubuntu 22.04 with CUDA 12
+- Ubuntu 24.04 with CUDA 12 or CUDA 13
+
+The CUDA major version is detected from the image. Override it only when
+necessary with `ZED_CUDA_MAJOR=12` or `ZED_CUDA_MAJOR=13`.
 
 Run the complete download-and-convert pipeline with:
 
@@ -22,12 +34,21 @@ bash run_droid_depth_all.sh \
   12
 ```
 
-The scripts use `python3` by default. If the global executable has a different
-name, select it explicitly:
+The scripts use `python3` by default. If the image's base executable has a
+different name, select it explicitly:
 
 ```bash
 PYTHON_BIN=python bash run_droid_depth_all.sh ...
 ```
+
+The resulting environment is stored at:
+
+```text
+<runtime_dir>/python-env
+```
+
+It is reused by subsequent runs. Set `DROID_DEPTH_PYTHON_ENV` before invoking
+the scripts to choose a different location.
 
 Downloading and conversion can also be run separately:
 

@@ -16,6 +16,16 @@ WORK_DIR="${5:-$HOME/droid_depth_runtime}"
 BATCH_SIZE="${6:-2}"
 REPO_ID="${7:-Sponbebob4258/droid-24k-external-svo}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BASE_PYTHON="${PYTHON_BIN:-python3}"
+PYTHON_ENV_DIR="${DROID_DEPTH_PYTHON_ENV:-$WORK_DIR/python-env}"
+
+# shellcheck source=prepare_python_env.sh
+source "$SCRIPT_DIR/prepare_python_env.sh"
+mkdir -p "$WORK_DIR"
+prepare_python_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
+export DROID_DEPTH_BASE_PYTHON="$(command -v "$BASE_PYTHON")"
+export PYTHON_BIN="$DROID_DEPTH_PYTHON"
+export DROID_DEPTH_PYTHON_ENV="$PYTHON_ENV_DIR"
 
 bash "$SCRIPT_DIR/download_droid_svo_inputs.sh" \
   "$CHUNKS" \

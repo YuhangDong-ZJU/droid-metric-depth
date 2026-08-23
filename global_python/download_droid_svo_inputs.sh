@@ -11,25 +11,23 @@ fi
 CHUNKS="$1"
 DOWNLOAD_DIR="$2"
 REPO_ID="${3:-Sponbebob4258/droid-24k-external-svo}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+BASE_PYTHON="${PYTHON_BIN:-python3}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_ENV_DIR="${DROID_DEPTH_PYTHON_ENV:-$DOWNLOAD_DIR/.droid_depth_runtime/python-env}"
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "ERROR: Python is not available: $PYTHON_BIN"
-  echo "Set PYTHON_BIN to the global Python executable if it is not python3."
-  exit 1
-fi
-PYTHON_BIN="$(command -v "$PYTHON_BIN")"
-if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-  echo "ERROR: pip is not available for the global Python: $PYTHON_BIN"
-  exit 1
-fi
+# shellcheck source=prepare_python_env.sh
+source "$SCRIPT_DIR/prepare_python_env.sh"
+prepare_python_env "$BASE_PYTHON" "$PYTHON_ENV_DIR"
+PYTHON_BIN="$DROID_DEPTH_PYTHON"
+
 if ! "$PYTHON_BIN" - <<'PY'
 import huggingface_hub
 import hf_xet
 PY
 then
-  echo "Installing download dependencies into the global Python environment."
-  "$PYTHON_BIN" -m pip install --upgrade huggingface_hub hf_xet
+  echo "Installing download dependencies into the isolated Python environment."
+  "$PYTHON_BIN" -m pip install --disable-pip-version-check \
+    huggingface_hub==1.28.0 hf_xet==1.6.0
 fi
 
 mkdir -p "$DOWNLOAD_DIR"
