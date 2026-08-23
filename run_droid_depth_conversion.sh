@@ -14,6 +14,7 @@ OUTPUT_DIR="$3"
 GPU_IDS="${4:-all}"
 WORK_DIR="${5:-$HOME/droid_depth_runtime}"
 BATCH_SIZE="${6:-2}"
+CHECK_ONLY="${DROID_DEPTH_CHECK_ONLY:-0}"
 ENV_NAME="droid_depth_convert"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONVERTER="$SCRIPT_DIR/convert_droid_depth.py"
@@ -218,6 +219,10 @@ if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: batch_size must be a positive integer, got: $BATCH_SIZE"
   exit 2
 fi
+if [[ "$CHECK_ONLY" != "0" && "$CHECK_ONLY" != "1" ]]; then
+  echo "ERROR: DROID_DEPTH_CHECK_ONLY must be 0 or 1."
+  exit 2
+fi
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda is not installed or is not in PATH."
@@ -233,7 +238,10 @@ if [[ ! -f "$CONVERTER" ]]; then
 fi
 
 eval "$(conda shell.bash hook)"
-mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+mkdir -p "$WORK_DIR"
+if [[ "$CHECK_ONLY" == "0" ]]; then
+  mkdir -p "$OUTPUT_DIR"
+fi
 
 if ! conda env list | awk '{print $1}' | grep -Fxq "$ENV_NAME"; then
   conda create -n "$ENV_NAME" --override-channels -c conda-forge \
@@ -268,8 +276,9 @@ fi
 
 ensure_pyzed
 
-conda run --no-capture-output -n "$ENV_NAME" \
-  python - "$INPUT_DIR" "$CHUNKS" "$ZED_SETTINGS_DIR" <<'PY'
+if [[ "$CHECK_ONLY" == "0" ]]; then
+  conda run --no-capture-output -n "$ENV_NAME" \
+    python - "$INPUT_DIR" "$CHUNKS" "$ZED_SETTINGS_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -310,6 +319,7 @@ if missing:
     raise RuntimeError(f"Missing {len(missing)} ZED calibration files, including:\n{preview}")
 print(f"ZED calibration preflight complete: {len(serials)} files.", flush=True)
 PY
+fi
 
 if [[ ! -d "$FS_ROOT/.git" ]]; then
   git clone --recursive https://github.com/NVlabs/FoundationStereo.git "$FS_ROOT"
@@ -419,6 +429,44 @@ IFS=',' read -r -a GPU_ARRAY <<<"$GPU_IDS"
 if [[ ${#GPU_ARRAY[@]} -eq 0 ]]; then
   echo "ERROR: no GPU was selected."
   exit 1
+fi
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+  CHECK_GPU="${GPU_ARRAY[0]}"
+  echo "Running FoundationStereo smoke test on GPU $CHECK_GPU."
+  conda run --no-capture-output -n "$ENV_NAME" \
+    python - "$CONVERTER" "$FS_ROOT" "$CHECKPOINT" "$CONFIG" "$CHECK_GPU" <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+import sys
+
+import numpy as np
+import torch
+
+converter_path, fs_root, checkpoint, config = map(Path, sys.argv[1:5])
+gpu_id = int(sys.argv[5])
+spec = spec_from_file_location("droid_depth_converter", converter_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Cannot import converter: {converter_path}")
+module = module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+if not torch.cuda.is_available():
+    raise RuntimeError("torch.cuda.is_available() is False")
+estimator = module.Estimator(fs_root, checkpoint, config, gpu_id, 2)
+image = np.zeros((720, 1280, 3), dtype=np.uint8)
+disparity = estimator.infer([image], [image])
+if disparity.shape != (1, 720, 1280) or not np.isfinite(disparity).all():
+    raise RuntimeError(f"Unexpected smoke-test output: {disparity.shape}")
+print(
+    f"Environment ready: GPU {gpu_id} ({torch.cuda.get_device_name(gpu_id)}), "
+    f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}",
+    flush=True,
+)
+PY
+  echo "Environment check complete: $WORK_DIR"
+  exit 0
 fi
 
 echo "GPU workers: ${GPU_ARRAY[*]}"

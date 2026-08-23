@@ -82,6 +82,19 @@ Download:
 bash run_droid_depth.sh download "0-18"
 ```
 
+Prepare and test the conversion environment on one GPU without reading SVO
+data or writing depth output:
+
+```bash
+bash run_droid_depth.sh check "h100_1" "0"
+```
+
+The check installs or reuses the Conda environment, ZED SDK, PyZED,
+FoundationStereo source, and checkpoint. It then loads the full model and runs
+one synthetic `1280x720` hierarchical inference. It can run in parallel with
+the `download` command in another terminal because the two commands use
+separate Conda environments and separate repository directories.
+
 Convert:
 
 ```bash
