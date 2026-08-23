@@ -26,9 +26,70 @@ CHECKPOINT_SHA256="60e79bde9c6a00acea551625ff814fe06e5a6806e2c0c9829baee248de87c
 ZED_SDK_VERSION="5.4.1"
 ZED_SDK_ROOT="$WORK_DIR/zed-sdk-$ZED_SDK_VERSION"
 ZED_SETTINGS_DIR="$INPUT_DIR/calibrations"
-ZED_INSTALLER_SHA256="35edc822377c5b548fb80f251d8347702cfc2f064f6b9920e29feebe387aec26"
 PYZED_VERSION="5.4"
 PYZED_WHEEL_SHA256="7521e6d7da8e8a98603dd7a0302c18fba2455024c9e77ec186d1ee01a4a786e9"
+
+detect_zed_cuda_major() {
+  local detected
+  if [[ "${ZED_CUDA_MAJOR:-auto}" =~ ^(12|13)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  detected="$(nvidia-smi 2>/dev/null \
+    | sed -n 's/.*CUDA Version: \([0-9][0-9]*\).*/\1/p' \
+    | head -n 1)"
+  if [[ "$detected" =~ ^(12|13)$ ]]; then
+    echo "$detected"
+    return 0
+  fi
+  echo 12
+}
+
+select_zed_installer() {
+  local cuda_major="$1"
+  if [[ ! -r /etc/os-release ]]; then
+    echo "ERROR: cannot identify the operating system from /etc/os-release." >&2
+    return 1
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    echo "ERROR: rootless ZED SDK installation requires Ubuntu." >&2
+    echo "Detected: ${ID:-unknown} ${VERSION_ID:-unknown}" >&2
+    return 1
+  fi
+  if [[ "${VERSION_ID:-}" == "22.04" && "$cuda_major" == "13" ]]; then
+    echo "Ubuntu 22.04 detected; selecting the CUDA 12 ZED build." >&2
+    cuda_major=12
+  fi
+
+  case "${VERSION_ID:-}:$cuda_major" in
+    22.04:12)
+      ZED_BUILD_ID="ubuntu22-cuda12"
+      ZED_INSTALLER_NAME="ZED_SDK_Ubuntu22_cuda12_v${ZED_SDK_VERSION}.run"
+      ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu22"
+      ZED_INSTALLER_SHA256="35edc822377c5b548fb80f251d8347702cfc2f064f6b9920e29feebe387aec26"
+      ;;
+    24.04:12)
+      ZED_BUILD_ID="ubuntu24-cuda12"
+      ZED_INSTALLER_NAME="ZED_SDK_Ubuntu24_cuda12_v${ZED_SDK_VERSION}.run"
+      ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu24"
+      ZED_INSTALLER_SHA256="bbed0c5fc563cdf1b611d1ea5fdbecd8ae5d059f85d0cf56ca93d8a0d6706877"
+      ;;
+    24.04:13)
+      ZED_BUILD_ID="ubuntu24-cuda13"
+      ZED_INSTALLER_NAME="ZED_SDK_Ubuntu24_cuda13_v${ZED_SDK_VERSION}.run"
+      ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu13/ubuntu24"
+      ZED_INSTALLER_SHA256="b576415517e869f8346beb961b5faa554e3b2e2dde20ca2eaa72f03cbef321ed"
+      ;;
+    *)
+      echo "ERROR: unsupported ZED SDK combination: Ubuntu ${VERSION_ID:-unknown}, CUDA $cuda_major." >&2
+      echo "Supported: Ubuntu 22.04/CUDA 12, Ubuntu 24.04/CUDA 12 or 13." >&2
+      return 1
+      ;;
+  esac
+  export ZED_BUILD_ID ZED_INSTALLER_NAME ZED_INSTALLER_URL ZED_INSTALLER_SHA256
+}
 
 get_local_zed_version() {
   local version_file="$ZED_SDK_ROOT/zed-config-version.cmake"
@@ -40,36 +101,32 @@ get_local_zed_version() {
 }
 
 ensure_zed_sdk() {
-  local installed_version installer installer_url actual_sha256 partial_root stale_root
+  local installed_version installer actual_sha256 partial_root stale_root
+  local build_marker installed_build cuda_major
+  cuda_major="$(detect_zed_cuda_major)"
+  select_zed_installer "$cuda_major"
+  build_marker="$ZED_SDK_ROOT/.droid_depth_build"
+  installed_build="$(cat "$build_marker" 2>/dev/null || true)"
   installed_version="$(get_local_zed_version)"
   if [[ "$installed_version" == "$ZED_SDK_VERSION" \
       && -r "$ZED_SDK_ROOT/lib/libsl_zed.so" \
-      && -r "$ZED_SDK_ROOT/resources/neural_depth_5.3.model" ]]; then
-    echo "User-local ZED SDK ready: $ZED_SDK_ROOT ($installed_version)"
+      && -r "$ZED_SDK_ROOT/resources/neural_depth_5.3.model" \
+      && ( "$installed_build" == "$ZED_BUILD_ID" \
+        || ( -z "$installed_build" && "$ZED_BUILD_ID" == "ubuntu22-cuda12" ) ) ]]; then
+    printf '%s\n' "$ZED_BUILD_ID" > "$build_marker"
+    echo "User-local ZED SDK ready: $ZED_SDK_ROOT ($installed_version, $ZED_BUILD_ID)"
     return 0
   fi
 
-  if [[ ! -r /etc/os-release ]]; then
-    echo "ERROR: cannot identify the operating system from /etc/os-release."
-    return 1
-  fi
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "22.04" ]]; then
-    echo "ERROR: rootless ZED SDK installation supports Ubuntu 22.04 only."
-    echo "Detected: ${ID:-unknown} ${VERSION_ID:-unknown}"
-    return 1
-  fi
   if [[ "$(uname -m)" != "x86_64" ]]; then
     echo "ERROR: rootless ZED SDK installation supports x86_64 only."
     return 1
   fi
 
-  installer="$WORK_DIR/ZED_SDK_Ubuntu22_cuda12_v${ZED_SDK_VERSION}.run"
-  installer_url="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu22"
-  echo "Downloading ZED SDK $ZED_SDK_VERSION for user-local extraction."
+  installer="$WORK_DIR/$ZED_INSTALLER_NAME"
+  echo "Downloading ZED SDK $ZED_SDK_VERSION ($ZED_BUILD_ID) for user-local extraction."
   wget --https-only --continue --progress=dot:giga \
-    --output-document="$installer" "$installer_url"
+    --output-document="$installer" "$ZED_INSTALLER_URL"
   if [[ ! -s "$installer" ]] || ! head -c 64 "$installer" | grep -q '^#!/bin/'; then
     echo "ERROR: downloaded ZED SDK installer is invalid: $installer"
     return 1
@@ -109,9 +166,10 @@ ensure_zed_sdk() {
     mv "$ZED_SDK_ROOT" "$stale_root"
     echo "Moved the previous incomplete SDK to: $stale_root"
   fi
+  printf '%s\n' "$ZED_BUILD_ID" > "$partial_root/.droid_depth_build"
   mv "$partial_root" "$ZED_SDK_ROOT"
   rm -f "$installer"
-  echo "User-local ZED SDK installed without sudo: $ZED_SDK_ROOT"
+  echo "User-local ZED SDK installed without sudo: $ZED_SDK_ROOT ($ZED_BUILD_ID)"
 }
 
 ensure_pyzed() {

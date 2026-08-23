@@ -17,7 +17,7 @@ The pipeline downloads selected SVO chunks from [`Sponbebob4258/droid-24k-extern
 
 ## Requirements
 
-- Ubuntu 22.04 x86_64
+- Ubuntu 22.04 or 24.04 x86_64
 - NVIDIA GPU and a working driver
 - Conda available in `PATH`
 - `git`, `curl`/`wget`, `tar`, `zstd`, and standard build/runtime utilities
@@ -25,6 +25,11 @@ The pipeline downloads selected SVO chunks from [`Sponbebob4258/droid-24k-extern
 - Enough storage for the selected SVO chunks and lossless depth PNGs
 
 No administrator privileges are required. The ZED SDK is extracted into the runtime directory supplied on the command line.
+
+The Conda pipeline supports Ubuntu 22.04/CUDA 12 and Ubuntu 24.04/CUDA 12
+or 13. It selects the ZED SDK build automatically from the OS and NVIDIA
+driver. Set `ZED_CUDA_MAJOR=12` or `ZED_CUDA_MAJOR=13` only when the automatic
+detection does not match the CUDA runtime exposed by the cluster image.
 
 ### uv-based global Python image variant (untested)
 
