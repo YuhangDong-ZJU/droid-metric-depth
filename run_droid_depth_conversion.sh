@@ -59,14 +59,25 @@ detect_zed_cuda_major() {
 
 select_zed_installer() {
   local cuda_major="$1"
-  if [[ ! -r /etc/os-release ]]; then
-    echo "ERROR: cannot identify the operating system from /etc/os-release." >&2
+  local os_release_file="${DROID_OS_RELEASE_FILE:-/etc/os-release}"
+  if [[ ! -r "$os_release_file" ]]; then
+    echo "ERROR: cannot identify the operating system from $os_release_file." >&2
     return 1
   fi
   # shellcheck disable=SC1091
-  source /etc/os-release
-  if [[ "${ID:-}" != "ubuntu" ]]; then
-    echo "ERROR: rootless ZED SDK installation requires Ubuntu." >&2
+  source "$os_release_file"
+
+  # Stereolabs does not publish a native Debian build. Debian 12 uses a newer
+  # glibc than Ubuntu 22.04, so for offline SVO playback we can rootlessly
+  # extract and strictly validate the Ubuntu 22.04/CUDA 12 binaries instead.
+  # The checks below still fail fast on unresolved libraries or PyZED import
+  # errors before any conversion workers are started.
+  if [[ "${ID:-}" == "debian" && "${VERSION_ID:-}" == "12" ]]; then
+    echo "WARNING: Debian 12 is not officially supported by the ZED SDK." >&2
+    echo "Using the Ubuntu 22.04/CUDA 12 ZED build in experimental rootless compatibility mode." >&2
+    cuda_major=12
+  elif [[ "${ID:-}" != "ubuntu" ]]; then
+    echo "ERROR: unsupported operating system for rootless ZED SDK installation." >&2
     echo "Detected: ${ID:-unknown} ${VERSION_ID:-unknown}" >&2
     return 1
   fi
@@ -75,28 +86,28 @@ select_zed_installer() {
     cuda_major=12
   fi
 
-  case "${VERSION_ID:-}:$cuda_major" in
-    22.04:12)
+  case "${ID:-}:${VERSION_ID:-}:$cuda_major" in
+    ubuntu:22.04:12|debian:12:12)
       ZED_BUILD_ID="ubuntu22-cuda12"
       ZED_INSTALLER_NAME="ZED_SDK_Ubuntu22_cuda12_v${ZED_SDK_VERSION}.run"
       ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu22"
       ZED_INSTALLER_SHA256="35edc822377c5b548fb80f251d8347702cfc2f064f6b9920e29feebe387aec26"
       ;;
-    24.04:12)
+    ubuntu:24.04:12)
       ZED_BUILD_ID="ubuntu24-cuda12"
       ZED_INSTALLER_NAME="ZED_SDK_Ubuntu24_cuda12_v${ZED_SDK_VERSION}.run"
       ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu12/ubuntu24"
       ZED_INSTALLER_SHA256="bbed0c5fc563cdf1b611d1ea5fdbecd8ae5d059f85d0cf56ca93d8a0d6706877"
       ;;
-    24.04:13)
+    ubuntu:24.04:13)
       ZED_BUILD_ID="ubuntu24-cuda13"
       ZED_INSTALLER_NAME="ZED_SDK_Ubuntu24_cuda13_v${ZED_SDK_VERSION}.run"
       ZED_INSTALLER_URL="https://download.stereolabs.com/zedsdk/${ZED_SDK_VERSION}/cu13/ubuntu24"
       ZED_INSTALLER_SHA256="b576415517e869f8346beb961b5faa554e3b2e2dde20ca2eaa72f03cbef321ed"
       ;;
     *)
-      echo "ERROR: unsupported ZED SDK combination: Ubuntu ${VERSION_ID:-unknown}, CUDA $cuda_major." >&2
-      echo "Supported: Ubuntu 22.04/CUDA 12, Ubuntu 24.04/CUDA 12 or 13." >&2
+      echo "ERROR: unsupported ZED SDK combination: ${ID:-unknown} ${VERSION_ID:-unknown}, CUDA $cuda_major." >&2
+      echo "Supported: Ubuntu 22.04/CUDA 12, Ubuntu 24.04/CUDA 12 or 13; Debian 12 experimental/CUDA 12." >&2
       return 1
       ;;
   esac
