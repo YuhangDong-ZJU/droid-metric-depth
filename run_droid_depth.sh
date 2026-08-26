@@ -20,6 +20,30 @@ check_name() {
   }
 }
 
+runtime_ready() {
+  local runtime_dir="$1"
+  [[ -d "$runtime_dir/FoundationStereo/.git" \
+    && -s "$runtime_dir/23-51-11/model_best_bp2.pth" \
+    && -r "$runtime_dir/zed-sdk-5.4.1/lib/libsl_zed.so" \
+    && -r "$runtime_dir/zed-sdk-5.4.1/resources/neural_depth_5.3.model" ]]
+}
+
+seed_runtime_from_check() {
+  local source_dir="$ROOT/Res/h100_1"
+  local target_dir="$1"
+  if [[ "$source_dir" == "$target_dir" ]] || runtime_ready "$target_dir"; then
+    return 0
+  fi
+  if ! runtime_ready "$source_dir"; then
+    echo "No complete checked runtime at $source_dir; preparing $target_dir normally."
+    return 0
+  fi
+  mkdir -p "$target_dir"
+  echo "Copying checked runtime: $source_dir -> $target_dir"
+  cp -a --reflink=auto "$source_dir/." "$target_dir/"
+  echo "Checked runtime copied."
+}
+
 if [[ -n "${MINIFORGE_HOME:-}" ]]; then
   export PATH="$MINIFORGE_HOME/bin:$PATH"
 fi
@@ -48,12 +72,14 @@ case "${1:-}" in
     [[ $# -ge 3 && $# -le 5 ]] || { usage; exit 2; }
     EXP_NAME="$3"
     check_name "$EXP_NAME"
+    WORK_DIR="$ROOT/Res/$EXP_NAME"
+    seed_runtime_from_check "$WORK_DIR"
     exec bash "$ROOT/run_droid_depth_conversion.sh" \
       "$2" \
       "$INPUT_DIR" \
       "$OUTPUT_DIR" \
       "${4:-all}" \
-      "$ROOT/Res/$EXP_NAME" \
+      "$WORK_DIR" \
       "${5:-2}"
     ;;
 
