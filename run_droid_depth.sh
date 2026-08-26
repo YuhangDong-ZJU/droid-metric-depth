@@ -110,6 +110,7 @@ case "${1:-}" in
       echo "ERROR: $ENV_NAME is not ready; run the check command first."
       exit 1
     fi
+    CONDA_PREFIX="$(conda run -n "$ENV_NAME" python -c 'import sys; print(sys.prefix)')"
     ZED_SDK_ROOT="$ROOT/Res/$3/zed-sdk-5.4.1"
     if [[ ! -r "$ZED_SDK_ROOT/lib/libsl_zed.so" ]]; then
       echo "ERROR: ZED SDK is not ready: $ZED_SDK_ROOT"
@@ -117,7 +118,7 @@ case "${1:-}" in
     fi
     export PYTHONNOUSERSITE=1
     export ZED_DIR="$ZED_SDK_ROOT"
-    export LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:${LD_LIBRARY_PATH:-}"
+    export LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
     exec conda run --no-capture-output -n "$ENV_NAME" \
       python "$ROOT/visualize_droid_depth.py" \
       --input-dir "$INPUT_DIR" \

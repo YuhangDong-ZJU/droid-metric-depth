@@ -115,7 +115,8 @@ select_zed_installer() {
 }
 
 get_local_zed_version() {
-  local version_file="$ZED_SDK_ROOT/zed-config-version.cmake"
+  local sdk_root="${1:-$ZED_SDK_ROOT}"
+  local version_file="$sdk_root/zed-config-version.cmake"
   if [[ ! -f "$version_file" ]]; then
     return 0
   fi
@@ -123,19 +124,25 @@ get_local_zed_version() {
     "$version_file" | head -n 1
 }
 
+is_compatible_zed_sdk() {
+  local sdk_root="$1" installed_build installed_version
+  installed_version="$(get_local_zed_version "$sdk_root")"
+  installed_build="$(cat "$sdk_root/.droid_depth_build" 2>/dev/null || true)"
+  [[ "$installed_version" == "$ZED_SDK_VERSION" \
+    && -r "$sdk_root/lib/libsl_zed.so" \
+    && -r "$sdk_root/resources/neural_depth_5.3.model" \
+    && ( "$installed_build" == "$ZED_BUILD_ID" \
+      || ( -z "$installed_build" && "$ZED_BUILD_ID" == "ubuntu22-cuda12" ) ) ]]
+}
+
 ensure_zed_sdk() {
   local installed_version installer actual_sha256 partial_root stale_root
-  local build_marker installed_build cuda_major
+  local build_marker cuda_major
   cuda_major="$(detect_zed_cuda_major)"
   select_zed_installer "$cuda_major"
   build_marker="$ZED_SDK_ROOT/.droid_depth_build"
-  installed_build="$(cat "$build_marker" 2>/dev/null || true)"
-  installed_version="$(get_local_zed_version)"
-  if [[ "$installed_version" == "$ZED_SDK_VERSION" \
-      && -r "$ZED_SDK_ROOT/lib/libsl_zed.so" \
-      && -r "$ZED_SDK_ROOT/resources/neural_depth_5.3.model" \
-      && ( "$installed_build" == "$ZED_BUILD_ID" \
-        || ( -z "$installed_build" && "$ZED_BUILD_ID" == "ubuntu22-cuda12" ) ) ]]; then
+  if is_compatible_zed_sdk "$ZED_SDK_ROOT"; then
+    installed_version="$(get_local_zed_version)"
     printf '%s\n' "$ZED_BUILD_ID" > "$build_marker"
     echo "User-local ZED SDK ready: $ZED_SDK_ROOT ($installed_version, $ZED_BUILD_ID)"
     return 0
@@ -196,7 +203,7 @@ ensure_zed_sdk() {
 }
 
 ensure_pyzed() {
-  local wheel wheel_url actual_sha256 installed_version pyzed_so
+  local wheel wheel_url actual_sha256 installed_version pyzed_so zed_library_path
   wheel="$WORK_DIR/pyzed-${PYZED_VERSION}-cp310-cp310-linux_x86_64.whl"
   wheel_url="https://download.stereolabs.com/zedsdk/${PYZED_VERSION}/whl/linux_x86_64/$(basename "$wheel")"
   installed_version="$($CONDA_PREFIX/bin/python -c \
@@ -213,15 +220,16 @@ ensure_pyzed() {
   fi
 
   pyzed_so="$($CONDA_PREFIX/bin/python -c 'import importlib.util; print(importlib.util.find_spec("pyzed.sl").origin)')"
+  zed_library_path="$ZED_SDK_ROOT/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
   "$CONDA_PREFIX/bin/patchelf" --set-rpath \
-    "$ZED_SDK_ROOT/lib:/usr/local/cuda/lib64" "$pyzed_so"
-  if LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:${LD_LIBRARY_PATH:-}" \
+    "$ZED_SDK_ROOT/lib:$CONDA_PREFIX/lib:/usr/local/cuda/lib64" "$pyzed_so"
+  if LD_LIBRARY_PATH="$zed_library_path" \
       ldd "$pyzed_so" | grep -q 'not found'; then
     echo "ERROR: the user-local ZED SDK has unresolved shared-library dependencies."
-    LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:${LD_LIBRARY_PATH:-}" ldd "$pyzed_so"
+    LD_LIBRARY_PATH="$zed_library_path" ldd "$pyzed_so"
     return 1
   fi
-  ZED_DIR="$ZED_SDK_ROOT" LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:${LD_LIBRARY_PATH:-}" \
+  ZED_DIR="$ZED_SDK_ROOT" LD_LIBRARY_PATH="$zed_library_path" \
     "$CONDA_PREFIX/bin/python" -c 'import pyzed.sl'
   echo "PyZED $PYZED_VERSION is linked to the user-local ZED SDK."
 }
@@ -262,15 +270,16 @@ CONDA_PREFIX="$(conda run -n "$ENV_NAME" python -c 'import sys; print(sys.prefix
 if [[ ! -x "$CONDA_PREFIX/bin/zstd" \
     || ! -x "$CONDA_PREFIX/bin/patchelf" \
     || ! -x "$CONDA_PREFIX/bin/git" \
-    || ! -x "$CONDA_PREFIX/bin/wget" ]]; then
+    || ! -x "$CONDA_PREFIX/bin/wget" \
+    || ! -r "$CONDA_PREFIX/lib/libturbojpeg.so.0" ]]; then
   conda install -n "$ENV_NAME" --override-channels -c conda-forge \
-    zstd patchelf git wget -y
+    zstd patchelf git wget libjpeg-turbo -y
 fi
 export PATH="$CONDA_PREFIX/bin:$PATH"
 
 ensure_zed_sdk
 export ZED_DIR="$ZED_SDK_ROOT"
-export LD_LIBRARY_PATH="$ZED_SDK_ROOT/lib:${LD_LIBRARY_PATH:-}"
+ZED_LIBRARY_PATH="$ZED_SDK_ROOT/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 if ! conda run -n "$ENV_NAME" python -c "import torch, torchvision, xformers, timm, omegaconf, scipy, imageio" >/dev/null 2>&1; then
   conda run -n "$ENV_NAME" python -m pip install --upgrade pip
@@ -489,7 +498,8 @@ export HF_XET_HIGH_PERFORMANCE=1
 PIDS=()
 for WORKER_INDEX in "${!GPU_ARRAY[@]}"; do
   GPU_ID="${GPU_ARRAY[$WORKER_INDEX]}"
-  conda run --no-capture-output -n "$ENV_NAME" python "$CONVERTER" \
+  LD_LIBRARY_PATH="$ZED_LIBRARY_PATH" \
+    conda run --no-capture-output -n "$ENV_NAME" python "$CONVERTER" \
     --chunks "$CHUNKS" \
     --input-dir "$INPUT_DIR" \
     --output-dir "$OUTPUT_DIR" \
