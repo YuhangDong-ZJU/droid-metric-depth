@@ -12,29 +12,32 @@ CHUNKS="$1"
 DOWNLOAD_DIR="$2"
 REPO_ID="${3:-Sponbebob4258/droid-24k-external-svo}"
 ENV_NAME="droid_depth_download"
+CONDA_BIN="${DROID_DEPTH_CONDA_BIN:-/XXXXX/miniforge3/bin/conda}"
 
-if ! command -v conda >/dev/null 2>&1; then
-  echo "ERROR: conda is not installed or is not in PATH."
+if [[ ! -x "$CONDA_BIN" ]]; then
+  echo "ERROR: conda is not executable: $CONDA_BIN"
   exit 1
 fi
 
-eval "$(conda shell.bash hook)"
+CONDA_BASE="$("$CONDA_BIN" info --base)"
+ENV_PREFIX="$CONDA_BASE/envs/$ENV_NAME"
+ENV_PYTHON="$ENV_PREFIX/bin/python"
 
-if ! conda env list | awk '{print $1}' | grep -Fxq "$ENV_NAME"; then
-  conda create -n "$ENV_NAME" --override-channels -c conda-forge python=3.10 pip -y
+if [[ ! -x "$ENV_PYTHON" ]]; then
+  "$CONDA_BIN" create -p "$ENV_PREFIX" --override-channels -c conda-forge python=3.10 pip -y
 fi
 
-conda run -n "$ENV_NAME" python -m pip install --upgrade huggingface_hub hf_xet
+if ! "$ENV_PYTHON" -c 'import huggingface_hub, hf_xet' >/dev/null 2>&1; then
+  "$ENV_PYTHON" -m pip install huggingface_hub hf_xet
+fi
 
 mkdir -p "$DOWNLOAD_DIR"
 export HF_XET_HIGH_PERFORMANCE=1
 
-conda run --no-capture-output -n "$ENV_NAME" python - "$REPO_ID" "$CHUNKS" "$DOWNLOAD_DIR" <<'PY'
+"$ENV_PYTHON" - "$REPO_ID" "$CHUNKS" "$DOWNLOAD_DIR" <<'PY'
 from __future__ import annotations
 
-import json
-import os
-import sys
+import json, os, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -63,16 +66,29 @@ def parse_chunks(value: str) -> list[int]:
 repo_id = sys.argv[1]
 chunks = parse_chunks(sys.argv[2])
 download_dir = Path(sys.argv[3]).resolve()
-download_workers = int(os.environ.get("DROID_DEPTH_DOWNLOAD_WORKERS", "8"))
+download_workers = int(os.environ.get("DROID_DEPTH_DOWNLOAD_WORKERS", "1"))
+request_interval = float(os.environ.get("DROID_DEPTH_DOWNLOAD_REQUEST_INTERVAL", "1"))
 if download_workers < 1:
     raise ValueError("DROID_DEPTH_DOWNLOAD_WORKERS must be positive")
+if request_interval < 0:
+    raise ValueError("DROID_DEPTH_DOWNLOAD_REQUEST_INTERVAL cannot be negative")
+
+request_lock = threading.Lock()
+next_request_at = 0.0
 
 print(f"Repository: {repo_id}", flush=True)
 print(f"Chunks: {chunks}", flush=True)
 print(f"Destination: {download_dir}", flush=True)
 print(f"Direct-download workers: {download_workers}", flush=True)
+print(f"Minimum request interval: {request_interval:.1f}s", flush=True)
 
 def download_file(filename: str) -> Path:
+    global next_request_at
+    with request_lock:
+        delay = next_request_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        next_request_at = time.monotonic() + request_interval
     return Path(
         hf_hub_download(
             repo_id=repo_id,

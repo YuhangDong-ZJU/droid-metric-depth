@@ -14,8 +14,8 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Queue
-from threading import Thread
+from queue import Full, Queue
+from threading import Event, Thread
 from types import ModuleType
 from typing import Any, Iterator, Sequence
 
@@ -32,6 +32,9 @@ EXPECTED_SHAPE = (720, 1280)
 MIN_DEPTH_MM = 20.0
 MAX_DEPTH_MM = 10_000.0
 MAX_TAIL_SHORTFALL = 2
+INTERPOLATE_INT_MAX_ERROR = (
+    "upsample_bilinear2d_nhwc only supports output tensors with less than INT_MAX elements"
+)
 _STOP = object()
 
 
@@ -54,6 +57,63 @@ class ConversionResult:
     status: str
     tail_missing_count: int = 0
     tail_retry_recovered_frames: int = 0
+
+
+@dataclass(frozen=True)
+class _PrefetchFailure:
+    error: BaseException
+
+
+class PrefetchedStereo:
+    def __init__(self, source: Iterator[StereoFrame], capacity: int) -> None:
+        self.source = source
+        self.queue: Queue[StereoFrame | _PrefetchFailure | object] = Queue(capacity)
+        self.stopped = Event()
+        self.thread = Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _put(self, value: StereoFrame | _PrefetchFailure | object) -> bool:
+        while not self.stopped.is_set():
+            try:
+                self.queue.put(value, timeout=0.1)
+                return True
+            except Full:
+                continue
+        return False
+
+    def _run(self) -> None:
+        try:
+            for frame in self.source:
+                if not self._put(frame):
+                    return
+            self._put(_STOP)
+        except BaseException as error:
+            self._put(_PrefetchFailure(error))
+        finally:
+            close = getattr(self.source, "close", None)
+            if close is not None:
+                close()
+
+    def __iter__(self) -> PrefetchedStereo:
+        return self
+
+    def __next__(self) -> StereoFrame:
+        value = self.queue.get()
+        if value is _STOP:
+            raise StopIteration
+        if isinstance(value, _PrefetchFailure):
+            raise value.error
+        return value
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.thread.join()
+
+    def __enter__(self) -> PrefetchedStereo:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def parse_chunks(value: str) -> list[int]:
@@ -250,11 +310,26 @@ class PngWriter:
         shutil.rmtree(self.temporary, ignore_errors=True)
 
 
-class AsyncPngWriter:
-    def __init__(self, destination: Path, fps: int, gpu_id: int) -> None:
+@dataclass(frozen=True)
+class _InferredFrame:
+    frame: StereoFrame
+    disparity: np.ndarray
+
+
+@dataclass(frozen=True)
+class _ReadyDepth:
+    depth: np.ndarray
+    timestamp_ms: float | None
+
+
+class AsyncDepthWriter:
+    def __init__(self, destination: Path, fps: int, gpu_id: int, capacity: int) -> None:
         self.writer = PngWriter(destination, fps, gpu_id)
-        self.queue: Queue[np.ndarray | object] = Queue(4)
+        self.queue: Queue[_InferredFrame | _ReadyDepth | object] = Queue(capacity)
         self.error: BaseException | None = None
+        self.valid_pixels = 0
+        self.total_pixels = 0
+        self.timestamps: list[float | None] = []
         self.thread = Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -265,7 +340,22 @@ class AsyncPngWriter:
                 if value is _STOP:
                     return
                 if self.error is None:
-                    self.writer.write(value)
+                    if isinstance(value, _InferredFrame):
+                        depth = depth_from_disparity(
+                            value.disparity,
+                            value.frame.intrinsic,
+                            value.frame.baseline_m,
+                        )
+                        timestamp_ms = value.frame.timestamp_ms
+                    elif isinstance(value, _ReadyDepth):
+                        depth = value.depth
+                        timestamp_ms = value.timestamp_ms
+                    else:
+                        raise TypeError(f"Unexpected depth queue item: {type(value).__name__}")
+                    self.writer.write(depth)
+                    self.valid_pixels += int(np.count_nonzero(depth))
+                    self.total_pixels += depth.size
+                    self.timestamps.append(timestamp_ms)
             except BaseException as error:
                 self.error = error
             finally:
@@ -275,9 +365,14 @@ class AsyncPngWriter:
         if self.error is not None:
             raise ConversionError("Asynchronous PNG writer failed") from self.error
 
-    def write(self, value: np.ndarray) -> None:
+    def write_disparity(self, frame: StereoFrame, disparity: np.ndarray) -> None:
         self._raise()
-        self.queue.put(value)
+        self.queue.put(_InferredFrame(frame, disparity))
+        self._raise()
+
+    def write_depth(self, depth: np.ndarray, timestamp_ms: float | None) -> None:
+        self._raise()
+        self.queue.put(_ReadyDepth(depth, timestamp_ms))
         self._raise()
 
     def close(self, expected_frames: int) -> None:
@@ -439,6 +534,8 @@ class Estimator:
         self.InputPadder = InputPadder
         self.iters = iters
         self.oom_fallbacks = 0
+        self.size_limit_fallbacks = 0
+        self.max_inference_batch_size: int | None = None
 
     def _infer(self, left_images: Sequence[np.ndarray], right_images: Sequence[np.ndarray]) -> np.ndarray:
         torch = self.torch
@@ -457,17 +554,45 @@ class Estimator:
         disparity = padder.unpad(disparity.float()).reshape(len(left_images), 720, 1280)
         return disparity.detach().cpu().numpy()
 
+    def _infer_split(
+        self,
+        left_images: Sequence[np.ndarray],
+        right_images: Sequence[np.ndarray],
+        midpoint: int,
+    ) -> np.ndarray:
+        return np.concatenate(
+            (
+                self.infer(left_images[:midpoint], right_images[:midpoint]),
+                self.infer(left_images[midpoint:], right_images[midpoint:]),
+            ),
+            axis=0,
+        )
+
     def infer(self, left_images: Sequence[np.ndarray], right_images: Sequence[np.ndarray]) -> np.ndarray:
+        if (
+            self.max_inference_batch_size is not None
+            and len(left_images) > self.max_inference_batch_size
+        ):
+            return self._infer_split(
+                left_images,
+                right_images,
+                self.max_inference_batch_size,
+            )
         try:
             return self._infer(left_images, right_images)
-        except self.torch.cuda.OutOfMemoryError:
-            if len(left_images) == 1:
+        except RuntimeError as error:
+            is_oom = isinstance(error, self.torch.cuda.OutOfMemoryError)
+            is_size_limit = INTERPOLATE_INT_MAX_ERROR in str(error)
+            if len(left_images) == 1 or not (is_oom or is_size_limit):
                 raise
-            self.oom_fallbacks += 1
-            self.torch.cuda.empty_cache()
-            return np.stack(
-                [self._infer([left], [right])[0] for left, right in zip(left_images, right_images)]
-            )
+            self.oom_fallbacks += int(is_oom)
+            self.size_limit_fallbacks += int(is_size_limit)
+            if is_oom:
+                self.torch.cuda.empty_cache()
+            midpoint = len(left_images) // 2
+            if is_size_limit:
+                self.max_inference_batch_size = midpoint
+            return self._infer_split(left_images, right_images, midpoint)
 
 
 def depth_from_disparity(disparity: np.ndarray, intrinsic: np.ndarray, baseline: float) -> np.ndarray:
@@ -513,22 +638,21 @@ def convert_one(
     if not calibration_file.is_file():
         raise ConversionError(f"Missing ZED calibration file: {calibration_file}")
     calibration_sha256 = hashlib.sha256(calibration_file.read_bytes()).hexdigest()
-    writer = AsyncPngWriter(destination, 15, gpu_id)
+    pipeline_capacity = max(batch_size * 2, 4)
+    writer = AsyncDepthWriter(destination, 15, gpu_id, pipeline_capacity)
     pending: list[StereoFrame] = []
-    timestamps: list[float | None] = []
     first: StereoFrame | None = None
-    valid_pixels = 0
-    total_pixels = 0
     inference_seconds = 0.0
     started = time.perf_counter()
-    fallback_start = estimator.oom_fallbacks
+    oom_fallback_start = estimator.oom_fallbacks
+    size_limit_fallback_start = estimator.size_limit_fallbacks
     initial_decoded_frames = 0
     decoded_frames = 0
     retry_recovered_frames = 0
     tail_retry_attempted = False
 
     def flush() -> None:
-        nonlocal valid_pixels, total_pixels, inference_seconds
+        nonlocal inference_seconds
         if not pending:
             return
         inference_start = time.perf_counter()
@@ -538,36 +662,40 @@ def convert_one(
         )
         inference_seconds += time.perf_counter() - inference_start
         for frame, disparity in zip(pending, disparities, strict=True):
-            depth = depth_from_disparity(disparity, frame.intrinsic, frame.baseline_m)
-            writer.write(depth)
-            valid_pixels += int(np.count_nonzero(depth))
-            total_pixels += depth.size
-            timestamps.append(frame.timestamp_ms)
+            writer.write_disparity(frame, disparity)
         pending.clear()
 
     try:
-        for frame in iter_stereo(svo, frame_count, gpu_id, zed_settings_dir):
-            if first is None:
-                first = frame
-            pending.append(frame)
-            decoded_frames += 1
-            if len(pending) == batch_size:
-                flush()
+        with PrefetchedStereo(
+            iter_stereo(svo, frame_count, gpu_id, zed_settings_dir),
+            pipeline_capacity,
+        ) as frames:
+            for frame in frames:
+                if first is None:
+                    first = frame
+                pending.append(frame)
+                decoded_frames += 1
+                if len(pending) == batch_size:
+                    flush()
         initial_decoded_frames = decoded_frames
         if decoded_frames < frame_count:
             tail_retry_attempted = True
-            for frame in iter_stereo(
-                svo,
-                frame_count,
-                gpu_id,
-                zed_settings_dir,
-                frame_start=decoded_frames,
-            ):
-                pending.append(frame)
-                decoded_frames += 1
-                retry_recovered_frames += 1
-                if len(pending) == batch_size:
-                    flush()
+            with PrefetchedStereo(
+                iter_stereo(
+                    svo,
+                    frame_count,
+                    gpu_id,
+                    zed_settings_dir,
+                    frame_start=decoded_frames,
+                ),
+                pipeline_capacity,
+            ) as frames:
+                for frame in frames:
+                    pending.append(frame)
+                    decoded_frames += 1
+                    retry_recovered_frames += 1
+                    if len(pending) == batch_size:
+                        flush()
         flush()
         tail_missing_count = frame_count - decoded_frames
         if decoded_frames == 0 or not 0 <= tail_missing_count <= MAX_TAIL_SHORTFALL:
@@ -578,15 +706,17 @@ def convert_one(
         if tail_missing_count:
             zero_depth = np.zeros(EXPECTED_SHAPE, dtype=np.uint16)
             for _ in range(tail_missing_count):
-                writer.write(zero_depth)
-                timestamps.append(None)
-                total_pixels += zero_depth.size
+                writer.write_depth(zero_depth, None)
         writer.close(frame_count)
     except BaseException:
         writer.cleanup()
         raise
 
-    if first is None or len(timestamps) != frame_count or not depth_is_valid(destination, frame_count):
+    if (
+        first is None
+        or len(writer.timestamps) != frame_count
+        or not depth_is_valid(destination, frame_count)
+    ):
         raise ConversionError(f"Output validation failed: {destination}")
     missing_frame_indices = list(range(decoded_frames, frame_count))
     write_json_atomic(
@@ -610,7 +740,7 @@ def convert_one(
                 "tail_missing_count": tail_missing_count,
                 "missing_frame_indices": missing_frame_indices,
                 "source_decode_complete": tail_missing_count == 0,
-                "timestamps_ms": timestamps,
+                "timestamps_ms": writer.timestamps,
             },
             "calibration": {
                 "intrinsic": first.intrinsic.tolist(),
@@ -627,7 +757,10 @@ def convert_one(
                 "iters": estimator.iters,
                 "small_ratio": 0.5,
                 "batch_size_requested": batch_size,
-                "batch_oom_fallbacks": estimator.oom_fallbacks - fallback_start,
+                "batch_oom_fallbacks": estimator.oom_fallbacks - oom_fallback_start,
+                "batch_size_limit_fallbacks": (
+                    estimator.size_limit_fallbacks - size_limit_fallback_start
+                ),
                 "checkpoint_sha256": checkpoint_sha256,
                 "gpu_id": gpu_id,
                 "inference_seconds": inference_seconds,
@@ -637,7 +770,7 @@ def convert_one(
                 "storage": "uint16 millimeter PNG",
                 "invalid_value": 0,
                 "valid_range_m": [0.02, 10.0],
-                "valid_fraction": valid_pixels / total_pixels,
+                "valid_fraction": writer.valid_pixels / writer.total_pixels,
                 "zero_filled_source_frames": tail_missing_count,
                 "path": str(destination.relative_to(output_dir)),
             },
