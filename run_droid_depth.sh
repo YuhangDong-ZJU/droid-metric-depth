@@ -8,6 +8,7 @@ OUTPUT_DIR="$ROOT/DATA/droid_depth_output"
 usage() {
   echo "Usage:"
   echo "  bash $0 download <chunks>"
+  echo "  bash $0 status <chunks>"
   echo "  bash $0 check <exp_name> [gpu_id]"
   echo "  bash $0 convert <chunks> <exp_name> [gpu_ids] [batch_size]"
   echo "  bash $0 visualize <episode> <exp_name> [camera] [gpu_id]"
@@ -53,6 +54,30 @@ case "${1:-}" in
     [[ $# -eq 2 ]] || { usage; exit 2; }
     exec bash "$ROOT/download_droid_svo_inputs.sh" \
       "$2" "$INPUT_DIR"
+    ;;
+
+  status)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    export PYTHONNOUSERSITE=1
+    ENV_NAME="droid_depth_convert"
+    if command -v conda >/dev/null 2>&1 \
+      && conda env list | awk '{print $1}' | grep -Fxq "$ENV_NAME"; then
+      exec conda run --no-capture-output -n "$ENV_NAME" \
+        python "$ROOT/check_droid_depth_progress.py" \
+        --chunks "$2" \
+        --input-dir "$INPUT_DIR" \
+        --output-dir "$OUTPUT_DIR"
+    fi
+    if ! command -v python3 >/dev/null 2>&1 \
+      || ! python3 -c 'import imageio, numpy' >/dev/null 2>&1; then
+      echo "ERROR: run 'check' or 'convert' once to create droid_depth_convert,"
+      echo "       or provide python3 with imageio and numpy installed."
+      exit 1
+    fi
+    exec python3 "$ROOT/check_droid_depth_progress.py" \
+      --chunks "$2" \
+      --input-dir "$INPUT_DIR" \
+      --output-dir "$OUTPUT_DIR"
     ;;
 
   check)
