@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import traceback
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Full, Queue
@@ -35,11 +36,32 @@ MAX_TAIL_SHORTFALL = 2
 INTERPOLATE_INT_MAX_ERROR = (
     "upsample_bilinear2d_nhwc only supports output tensors with less than INT_MAX elements"
 )
+FATAL_CUDA_ERROR_MARKERS = (
+    "an illegal memory access was encountered",
+    "cudaerrorillegaladdress",
+    "code=700",
+    "err [700]",
+    "device-side assert triggered",
+    "unspecified launch failure",
+)
 _STOP = object()
 
 
 class ConversionError(RuntimeError):
     pass
+
+
+def is_fatal_cuda_error(error: BaseException) -> bool:
+    """Return whether a fresh process is required to obtain a valid CUDA context."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    messages: list[str] = []
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(f"{type(current).__name__}: {current}".lower())
+        current = current.__cause__ or current.__context__
+    combined = "\n".join(messages)
+    return any(marker in combined for marker in FATAL_CUDA_ERROR_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -608,23 +630,24 @@ class Estimator:
                 raise
             self.oom_fallbacks += int(is_oom)
             self.size_limit_fallbacks += int(is_size_limit)
-            if is_oom:
-                self.torch.cuda.empty_cache()
             midpoint = len(left_images) // 2
             reason = "CUDA OOM" if is_oom else "operator size limit"
-            print(
-                f"[GPU {self.gpu_id}] inference batch {len(left_images)} hit {reason}; "
-                f"retrying with chunks of at most {midpoint}",
-                flush=True,
+        # Retry only after leaving the exception handler. Its traceback can
+        # retain large CUDA tensors until the exception variable is cleared.
+        self.torch.cuda.empty_cache()
+        print(
+            f"[GPU {self.gpu_id}] inference batch {len(left_images)} hit {reason}; "
+            f"retrying with chunks of at most {midpoint}",
+            flush=True,
+        )
+        if self.max_inference_batch_size is None:
+            self.max_inference_batch_size = midpoint
+        else:
+            self.max_inference_batch_size = min(
+                self.max_inference_batch_size,
+                midpoint,
             )
-            if self.max_inference_batch_size is None:
-                self.max_inference_batch_size = midpoint
-            else:
-                self.max_inference_batch_size = min(
-                    self.max_inference_batch_size,
-                    midpoint,
-                )
-            return self._infer_split(left_images, right_images, midpoint)
+        return self._infer_split(left_images, right_images, midpoint)
 
 
 def depth_from_disparity(disparity: np.ndarray, intrinsic: np.ndarray, baseline: float) -> np.ndarray:
@@ -653,6 +676,7 @@ def convert_one(
     batch_size: int,
     checkpoint_sha256: str,
     overwrite: bool,
+    prefetch: bool,
 ) -> ConversionResult:
     destination = depth_dir(output_dir, row, role)
     sidecar = metadata_path(output_dir, row, role)
@@ -671,7 +695,7 @@ def convert_one(
     if not calibration_file.is_file():
         raise ConversionError(f"Missing ZED calibration file: {calibration_file}")
     calibration_sha256 = hashlib.sha256(calibration_file.read_bytes()).hexdigest()
-    prefetch_capacity = max(batch_size * 2, 4)
+    prefetch_capacity = max(batch_size * 2, 4) if prefetch else 0
     writer_capacity = max(batch_size, 4)
     writer = AsyncDepthWriter(destination, 15, gpu_id, writer_capacity)
     pending: list[StereoFrame] = []
@@ -700,10 +724,13 @@ def convert_one(
         pending.clear()
 
     try:
-        with PrefetchedStereo(
-            iter_stereo(svo, frame_count, gpu_id, zed_settings_dir),
-            prefetch_capacity,
-        ) as frames:
+        initial_source = iter_stereo(svo, frame_count, gpu_id, zed_settings_dir)
+        initial_frames = (
+            PrefetchedStereo(initial_source, prefetch_capacity)
+            if prefetch
+            else closing(initial_source)
+        )
+        with initial_frames as frames:
             for frame in frames:
                 if first is None:
                     first = frame
@@ -714,16 +741,19 @@ def convert_one(
         initial_decoded_frames = decoded_frames
         if decoded_frames < frame_count:
             tail_retry_attempted = True
-            with PrefetchedStereo(
-                iter_stereo(
-                    svo,
-                    frame_count,
-                    gpu_id,
-                    zed_settings_dir,
-                    frame_start=decoded_frames,
-                ),
-                prefetch_capacity,
-            ) as frames:
+            retry_source = iter_stereo(
+                svo,
+                frame_count,
+                gpu_id,
+                zed_settings_dir,
+                frame_start=decoded_frames,
+            )
+            retry_frames = (
+                PrefetchedStereo(retry_source, prefetch_capacity)
+                if prefetch
+                else closing(retry_source)
+            )
+            with retry_frames as frames:
                 for frame in frames:
                     pending.append(frame)
                     decoded_frames += 1
@@ -796,6 +826,7 @@ def convert_one(
                     estimator.max_successful_batch_size,
                 ),
                 "batch_size_effective_limit": estimator.max_inference_batch_size,
+                "prefetch_enabled": prefetch,
                 "prefetch_capacity": prefetch_capacity,
                 "writer_capacity": writer_capacity,
                 "batch_oom_fallbacks": estimator.oom_fallbacks - oom_fallback_start,
@@ -841,6 +872,11 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--iters", type=int, default=32)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--no-prefetch",
+        action="store_true",
+        help="Decode SVO frames synchronously for recovery after a worker failure.",
+    )
     args = parser.parse_args()
 
     chunks = parse_chunks(args.chunks)
@@ -907,16 +943,19 @@ def main() -> int:
                     args.batch_size,
                     args.checkpoint_sha256,
                     args.overwrite,
+                    not args.no_prefetch,
                 )
             # Do not swallow KeyboardInterrupt/SystemExit: Ctrl-C must stop the
             # worker instead of recording one failed episode and continuing.
             except Exception as error:
                 failures += 1
+                fatal_cuda = is_fatal_cuda_error(error)
                 event.update(
                     status="failed",
                     error_type=type(error).__name__,
                     message=str(error),
                     traceback=traceback.format_exc(),
+                    fatal_cuda=fatal_cuda,
                 )
             else:
                 event.update(
@@ -930,6 +969,13 @@ def main() -> int:
                 f"episode={row['episode_index']} role={role} status={event['status']}",
                 flush=True,
             )
+            if event.get("fatal_cuda"):
+                print(
+                    f"[GPU {args.gpu_id}] CUDA context is corrupted; "
+                    "exiting this worker for a clean process restart.",
+                    flush=True,
+                )
+                return 86
     return int(failures > 0)
 
 

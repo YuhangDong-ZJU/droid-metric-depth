@@ -15,6 +15,7 @@ GPU_IDS="${4:-all}"
 WORK_DIR="${5:-$HOME/droid_depth_runtime}"
 BATCH_SIZE="${6:-2}"
 CHECK_ONLY="${DROID_DEPTH_CHECK_ONLY:-0}"
+MAX_ATTEMPTS="${DROID_DEPTH_MAX_ATTEMPTS:-3}"
 ENV_NAME="droid_depth_convert"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONVERTER="$SCRIPT_DIR/convert_droid_depth.py"
@@ -240,6 +241,10 @@ if [[ ! "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ "$CHECK_ONLY" != "0" && "$CHECK_ONLY" != "1" ]]; then
   echo "ERROR: DROID_DEPTH_CHECK_ONLY must be 0 or 1."
+  exit 2
+fi
+if [[ ! "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: DROID_DEPTH_MAX_ATTEMPTS must be a positive integer."
   exit 2
 fi
 
@@ -495,37 +500,61 @@ echo "Batch size per GPU worker: $BATCH_SIZE"
 export OMP_NUM_THREADS=4
 export HF_XET_HIGH_PERFORMANCE=1
 
-PIDS=()
-for WORKER_INDEX in "${!GPU_ARRAY[@]}"; do
-  GPU_ID="${GPU_ARRAY[$WORKER_INDEX]}"
-  LD_LIBRARY_PATH="$ZED_LIBRARY_PATH" \
-    conda run --no-capture-output -n "$ENV_NAME" python "$CONVERTER" \
-    --chunks "$CHUNKS" \
-    --input-dir "$INPUT_DIR" \
-    --output-dir "$OUTPUT_DIR" \
-    --zed-settings-dir "$ZED_SETTINGS_DIR" \
-    --fs-root "$FS_ROOT" \
-    --checkpoint "$CHECKPOINT" \
-    --config "$CONFIG" \
-    --checkpoint-sha256 "$CHECKPOINT_SHA256" \
-    --gpu-id "$GPU_ID" \
-    --worker-index "$WORKER_INDEX" \
-    --num-workers "${#GPU_ARRAY[@]}" \
-    --batch-size "$BATCH_SIZE" \
-    --iters 32 &
-  PIDS+=("$!")
-done
-
-FAILED=0
-for PID in "${PIDS[@]}"; do
-  if ! wait "$PID"; then
-    FAILED=1
+ATTEMPT=1
+ATTEMPT_BATCH_SIZE="$BATCH_SIZE"
+while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
+  EXTRA_ARGS=()
+  PREFETCH_MODE="on"
+  if [[ "$ATTEMPT" -gt 1 ]]; then
+    EXTRA_ARGS+=(--no-prefetch)
+    PREFETCH_MODE="off"
   fi
+  echo "Conversion attempt $ATTEMPT/$MAX_ATTEMPTS: batch=$ATTEMPT_BATCH_SIZE, prefetch=$PREFETCH_MODE"
+
+  PIDS=()
+  for WORKER_INDEX in "${!GPU_ARRAY[@]}"; do
+    GPU_ID="${GPU_ARRAY[$WORKER_INDEX]}"
+    LD_LIBRARY_PATH="$ZED_LIBRARY_PATH" \
+      conda run --no-capture-output -n "$ENV_NAME" python "$CONVERTER" \
+      --chunks "$CHUNKS" \
+      --input-dir "$INPUT_DIR" \
+      --output-dir "$OUTPUT_DIR" \
+      --zed-settings-dir "$ZED_SETTINGS_DIR" \
+      --fs-root "$FS_ROOT" \
+      --checkpoint "$CHECKPOINT" \
+      --config "$CONFIG" \
+      --checkpoint-sha256 "$CHECKPOINT_SHA256" \
+      --gpu-id "$GPU_ID" \
+      --worker-index "$WORKER_INDEX" \
+      --num-workers "${#GPU_ARRAY[@]}" \
+      --batch-size "$ATTEMPT_BATCH_SIZE" \
+      --iters 32 \
+      "${EXTRA_ARGS[@]}" &
+    PIDS+=("$!")
+  done
+
+  FAILED=0
+  for PID in "${PIDS[@]}"; do
+    if ! wait "$PID"; then
+      FAILED=1
+    fi
+  done
+
+  if [[ "$FAILED" -eq 0 ]]; then
+    echo "Depth conversion complete: $OUTPUT_DIR"
+    exit 0
+  fi
+  if [[ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]]; then
+    break
+  fi
+
+  NEXT_BATCH_SIZE="$(((ATTEMPT_BATCH_SIZE + 1) / 2))"
+  echo "One or more workers failed. Completed outputs will be skipped; "\
+"restarting all workers with clean CUDA contexts, batch=$NEXT_BATCH_SIZE and prefetch=off."
+  ATTEMPT_BATCH_SIZE="$NEXT_BATCH_SIZE"
+  ATTEMPT="$((ATTEMPT + 1))"
 done
 
-if [[ "$FAILED" -ne 0 ]]; then
-  echo "ERROR: one or more GPU workers failed. Check $OUTPUT_DIR/logs/."
-  exit 1
-fi
-
-echo "Depth conversion complete: $OUTPUT_DIR"
+echo "ERROR: conversion still has failed tasks after $MAX_ATTEMPTS attempts."
+echo "Check $OUTPUT_DIR/logs/ and run the same command again after resolving persistent errors."
+exit 1
