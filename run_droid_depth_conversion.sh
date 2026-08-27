@@ -15,7 +15,6 @@ GPU_IDS="${4:-all}"
 WORK_DIR="${5:-$HOME/droid_depth_runtime}"
 BATCH_SIZE="${6:-2}"
 CHECK_ONLY="${DROID_DEPTH_CHECK_ONLY:-0}"
-MAX_ATTEMPTS="${DROID_DEPTH_MAX_ATTEMPTS:-3}"
 ENV_NAME="droid_depth_convert"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONVERTER="$SCRIPT_DIR/convert_droid_depth.py"
@@ -243,11 +242,6 @@ if [[ "$CHECK_ONLY" != "0" && "$CHECK_ONLY" != "1" ]]; then
   echo "ERROR: DROID_DEPTH_CHECK_ONLY must be 0 or 1."
   exit 2
 fi
-if [[ ! "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ERROR: DROID_DEPTH_MAX_ATTEMPTS must be a positive integer."
-  exit 2
-fi
-
 if ! command -v conda >/dev/null 2>&1; then
   echo "ERROR: conda is not installed or is not in PATH."
   exit 1
@@ -500,16 +494,14 @@ echo "Batch size per GPU worker: $BATCH_SIZE"
 export OMP_NUM_THREADS=4
 export HF_XET_HIGH_PERFORMANCE=1
 
-ATTEMPT=1
-ATTEMPT_BATCH_SIZE="$BATCH_SIZE"
-while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
+for ATTEMPT in 1 2; do
   EXTRA_ARGS=()
   PREFETCH_MODE="on"
-  if [[ "$ATTEMPT" -gt 1 ]]; then
+  if [[ "$ATTEMPT" -eq 2 ]]; then
     EXTRA_ARGS+=(--no-prefetch)
     PREFETCH_MODE="off"
   fi
-  echo "Conversion attempt $ATTEMPT/$MAX_ATTEMPTS: batch=$ATTEMPT_BATCH_SIZE, prefetch=$PREFETCH_MODE"
+  echo "Conversion attempt $ATTEMPT/2: batch=$BATCH_SIZE, prefetch=$PREFETCH_MODE"
 
   PIDS=()
   for WORKER_INDEX in "${!GPU_ARRAY[@]}"; do
@@ -527,7 +519,7 @@ while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
       --gpu-id "$GPU_ID" \
       --worker-index "$WORKER_INDEX" \
       --num-workers "${#GPU_ARRAY[@]}" \
-      --batch-size "$ATTEMPT_BATCH_SIZE" \
+      --batch-size "$BATCH_SIZE" \
       --iters 32 \
       "${EXTRA_ARGS[@]}" &
     PIDS+=("$!")
@@ -544,17 +536,12 @@ while [[ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]]; do
     echo "Depth conversion complete: $OUTPUT_DIR"
     exit 0
   fi
-  if [[ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]]; then
-    break
+  if [[ "$ATTEMPT" -eq 1 ]]; then
+    echo "One or more workers failed. Completed outputs will be skipped; "\
+"restarting with clean CUDA contexts, the same batch size and prefetch disabled."
   fi
-
-  NEXT_BATCH_SIZE="$(((ATTEMPT_BATCH_SIZE + 1) / 2))"
-  echo "One or more workers failed. Completed outputs will be skipped; "\
-"restarting all workers with clean CUDA contexts, batch=$NEXT_BATCH_SIZE and prefetch=off."
-  ATTEMPT_BATCH_SIZE="$NEXT_BATCH_SIZE"
-  ATTEMPT="$((ATTEMPT + 1))"
 done
 
-echo "ERROR: conversion still has failed tasks after $MAX_ATTEMPTS attempts."
+echo "ERROR: conversion still has failed tasks after one clean-process retry."
 echo "Check $OUTPUT_DIR/logs/ and run the same command again after resolving persistent errors."
 exit 1
